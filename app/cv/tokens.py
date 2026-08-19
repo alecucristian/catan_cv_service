@@ -2,9 +2,9 @@ import os
 import math
 import numpy as np
 import cv2
-import pytesseract
 from scipy.optimize import linear_sum_assignment
 from .utils import rgb_to_hsv, clamp
+
 
 TOKEN_VALUES = [2, 3, 4, 5, 6, 8, 9, 10, 11, 12]
 
@@ -199,33 +199,6 @@ def predict_numeric_ocr_scores(digit_roi):
                     best_iou = iou
         scores[val] = best_iou
     return scores
-
-def run_tesseract_ocr(digit_patch):
-    """
-    Pre-processes digit patch (binarization, padding, upscaling)
-    and executes Tesseract OCR for digit detection.
-    """
-    try:
-        gray = cv2.cvtColor(digit_patch, cv2.COLOR_RGB2GRAY)
-        # Resize to 120x120 for crisp OCR reading
-        resized = cv2.resize(gray, (120, 120), interpolation=cv2.INTER_CUBIC)
-        # Otsu thresholding
-        _, thresh = cv2.threshold(resized, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        # Add white border margin
-        padded = cv2.copyMakeBorder(thresh, 15, 15, 15, 15, cv2.BORDER_CONSTANT, value=255)
-        
-        text = pytesseract.image_to_string(
-            padded,
-            config='--psm 7 -c tessedit_char_whitelist=0123456789'
-        ).strip()
-        
-        if text.isdigit():
-            val = int(text)
-            if val in TOKEN_VALUES:
-                return val
-    except Exception:
-        pass
-    return None
 
 def compute_ssim(img1, img2):
     """
