@@ -4,7 +4,6 @@ import numpy as np
 import cv2
 from scipy.optimize import linear_sum_assignment
 from .utils import clamp
-from .tokens import extract_edge_vector, build_ink_mask, best_similarity
 
 HARBOR_TYPES = ["3:1", "wood 2:1", "brick 2:1", "sheep 2:1", "wheat 2:1", "ore 2:1"]
 
@@ -17,88 +16,6 @@ MODE_FRAME_SLOTS = {
     "four": 18,
     "six": 22
 }
-
-def make_harbor_variants(img_rgb, out_width, out_height, scales, angles, offsets):
-    variants = []
-    w, h = out_width, out_height
-    for scale in scales:
-        for angle in angles:
-            for offset in offsets:
-                dx = offset["dx"]
-                dy = offset["dy"]
-                
-                # Canvas-equivalent affine warp math
-                cos_t = math.cos(angle)
-                sin_t = math.sin(angle)
-                
-                a = scale * cos_t
-                b = -scale * sin_t
-                c = scale * sin_t
-                d = scale * cos_t
-                
-                tx = w/2.0 + a * (-w/2.0 + dx) + b * (-h/2.0 + dy)
-                ty = h/2.0 + c * (-w/2.0 + dx) + d * (-h/2.0 + dy)
-                
-                M = np.array([
-                    [a, b, tx],
-                    [c, d, ty]
-                ], dtype=np.float32)
-                
-                warped = cv2.warpAffine(img_rgb, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-                variants.append(warped)
-    return variants
-
-_harbor_template_store = None
-
-def ensure_harbor_template_store():
-    global _harbor_template_store
-    if _harbor_template_store is not None:
-        return _harbor_template_store
-        
-    store = {}
-    angles = [0, math.pi / 3.0, 2 * math.pi / 3.0, math.pi, 4 * math.pi / 3.0, 5 * math.pi / 3.0]
-    scales = [0.9, 1.0, 1.1]
-    offsets = [
-        {"dx": 0, "dy": 0},
-        {"dx": -1, "dy": 0},
-        {"dx": 1, "dy": 0},
-        {"dx": 0, "dy": -1},
-        {"dx": 0, "dy": 1}
-    ]
-    
-    # Path relative to working directory or absolute
-    base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    templates_path = os.path.join(base_dir, "templates")
-    
-    # Harbor template file names mapping
-    template_files = {
-        "3:1": "harbor_3to1.png",
-        "wood 2:1": "harbor_wood.png",
-        "brick 2:1": "harbor_brick.png",
-        "sheep 2:1": "harbor_sheep.png",
-        "wheat 2:1": "harbor_grain.png",
-        "ore 2:1": "harbor_ore.png"
-    }
-    
-    for harbor_type in HARBOR_TYPES:
-        filename = template_files[harbor_type]
-        path = os.path.join(templates_path, filename)
-        
-        img_bgr = cv2.imread(path)
-        if img_bgr is None:
-            raise FileNotFoundError(f"Could not load harbor template at path: {path}")
-        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        
-        base = cv2.resize(img_rgb, (56, 56), interpolation=cv2.INTER_LINEAR)
-        variants = make_harbor_variants(base, 56, 56, scales, angles, offsets)
-        
-        store[harbor_type] = {
-            "edgeVectors": np.array([extract_edge_vector(v, 56, 56) for v in variants], dtype=np.float32),
-            "inkVectors": np.array([build_ink_mask(v) for v in variants], dtype=np.float32)
-        }
-        
-    _harbor_template_store = store
-    return _harbor_template_store
 
 def global_assign_harbors(scored_slots, mode_key):
     harbors_pool = list(MODE_HARBOR_POOLS.get(mode_key) or MODE_HARBOR_POOLS["four"])
@@ -149,7 +66,6 @@ def global_assign_harbors(scored_slots, mode_key):
     return assigned_slots
 
 def detect_harbors(center_result):
-    templates = ensure_harbor_template_store()
     mode_key = "six" if center_result["modeKey"] == "six" else "four"
     
     from .tokens import calibrate_canvas_colors
