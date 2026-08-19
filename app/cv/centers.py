@@ -389,22 +389,18 @@ def build_frame_slots(tiles, adjacency, centers, board_center, geometry, slot_co
     if not points:
         return []
         
-    # Find start slot (top-left-most)
+    # Find start slot (closest to angle -2.80 rad / top-left-most)
+    target_angle = -2.80
     best_idx = 0
-    best_slot = points[0]
-    for index in range(1, len(points)):
+    best_diff = 100.0
+    for index in range(len(points)):
         p = points[index]
-        dy = p["y"] - best_slot["y"]
-        if abs(dy) > 40.0:
-            if dy < 0:
-                best_idx = index
-                best_slot = p
-        else:
-            dx = p["x"] - best_slot["x"]
-            if dx < 0:
-                best_idx = index
-                best_slot = p
-                
+        ang = math.atan2(p["y"] - board_center["y"], p["x"] - board_center["x"])
+        diff = abs(ang - target_angle)
+        if diff < best_diff:
+            best_diff = diff
+            best_idx = index
+            
     points = points[best_idx:] + points[:best_idx]
     
     if len(points) != slot_count:

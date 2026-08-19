@@ -47,15 +47,24 @@ def generate_board_code(tiles, spiral_order, ports):
     # Order ports by slotIndex
     sorted_ports = sorted(ports, key=lambda p: p["slotIndex"])
     
+    # Ground truth format puts slot 0 letter at end if slot 0, or formatted as LetterSlotNumber (e.g. W2 T4 G6 T8 T10 O12 B14 T16 S)
     harbor_parts = []
+    slot0_code = None
     for port in sorted_ports:
         port_type = port["type"]
         h_code = HARBOR_LETTER_MAP.get(port_type, "T")
-        harbor_parts.append(f"{port['slotIndex']}{h_code}")
+        idx = port["slotIndex"]
+        if idx == 0:
+            slot0_code = h_code
+        else:
+            harbor_parts.append(f"{h_code}{idx}")
+            
+    if slot0_code is not None:
+        harbor_parts.append(slot0_code)
         
     harbor_code = ""
     if harbor_parts:
-        harbor_code = " P" + "".join(harbor_parts)
+        harbor_code = " P0" + "".join(harbor_parts)
         
     return tile_code + harbor_code
 

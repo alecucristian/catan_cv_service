@@ -142,6 +142,64 @@ def detect_probability_pips(patch, is_red=False):
 
 
 
+_numeric_template_masks = None
+
+def ensure_numeric_template_masks():
+    global _numeric_template_masks
+    if _numeric_template_masks is not None:
+        return _numeric_template_masks
+        
+    store = {}
+    base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    templates_dir = os.path.join(base_dir, "templates")
+    
+    for val in TOKEN_VALUES:
+        path = os.path.join(templates_dir, f"num_{val}.png")
+        if os.path.exists(path):
+            img_bgr = cv2.imread(path)
+            if img_bgr is not None:
+                img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+                roi = extract_digit_roi(cv2.resize(img_rgb, (56, 56)))
+                gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
+                bg_luma = np.median(gray)
+                _, thresh = cv2.threshold(gray, max(110, bg_luma - 25), 255, cv2.THRESH_BINARY_INV)
+                store[val] = (thresh > 0).astype(np.float32)
+    _numeric_template_masks = store
+    return _numeric_template_masks
+
+def shift_image(img, dx, dy):
+    M = np.float32([[1, 0, dx], [0, 1, dy]])
+    return cv2.warpAffine(img, M, (img.shape[1], img.shape[0]))
+
+def predict_numeric_ocr_scores(digit_roi):
+    """
+    Numeric OCR Engine: Binarizes unknown digit glyph and matches against 
+    canonical Catan numeric font templates via shift-invariant IoU.
+    """
+    tmpl_masks = ensure_numeric_template_masks()
+    gray = cv2.cvtColor(digit_roi, cv2.COLOR_RGB2GRAY) if len(digit_roi.shape) == 3 else digit_roi.copy()
+    bg_luma = np.median(gray)
+    _, thresh = cv2.threshold(gray, max(110, bg_luma - 25), 255, cv2.THRESH_BINARY_INV)
+    unknown = (thresh > 0).astype(np.float32)
+    
+    scores = {}
+    for val in TOKEN_VALUES:
+        tmpl = tmpl_masks.get(val)
+        if tmpl is None or tmpl.shape != unknown.shape:
+            scores[val] = 0.0
+            continue
+        best_iou = 0.0
+        for dx in (-3, -1, 0, 1, 3):
+            for dy in (-3, -1, 0, 1, 3):
+                s_unk = shift_image(unknown, dx, dy)
+                inter = np.sum(s_unk * tmpl)
+                union = np.sum(s_unk) + np.sum(tmpl) - inter
+                iou = float(inter / max(1.0, union))
+                if iou > best_iou:
+                    best_iou = iou
+        scores[val] = best_iou
+    return scores
+
 def run_tesseract_ocr(digit_patch):
     """
     Pre-processes digit patch (binarization, padding, upscaling)
@@ -391,7 +449,8 @@ def detect_tokens(center_result, tile_result):
     h_img, w_img, _ = calibrated_img.shape
     
     hex_w = center_result["geometry"]["hexW"]
-    search_dist = hex_w * 0.28
+    hex_h = center_result["geometry"]["hexH"]
+    search_dist = hex_w * 0.25
     
     land_tiles = [tile for tile in tile_result["tiles"] if tile["resource"] != "desert"]
     
@@ -401,12 +460,16 @@ def detect_tokens(center_result, tile_result):
         cx = tile_center["x"]
         cy = tile_center["y"]
         
-        # Find closest marker
+        # Token markers on Colonist.io web canvas rendered at lower portion of hex tile
+        target_cx = cx
+        target_cy = cy + hex_h * 0.20
+        
+        # Find closest valid token marker (rejecting Ore rocks at upper hex)
         closest_marker = None
         min_dist = float('inf')
         markers = center_result["markerDebug"]["markers"]
         for m in markers:
-            d = math.hypot(m["x"] - tile_center["x"], m["y"] - tile_center["y"])
+            d = math.hypot(m["x"] - target_cx, m["y"] - target_cy)
             if d < search_dist and d < min_dist:
                 min_dist = d
                 closest_marker = m
@@ -415,32 +478,11 @@ def detect_tokens(center_result, tile_result):
             cx = closest_marker["x"]
             cy = closest_marker["y"]
         else:
-            search_r = int(round(hex_w * 0.35))
-            fx0 = max(0, int(round(cx - search_r)))
-            fy0 = max(0, int(round(cy - search_r)))
-            fx1 = min(w_img, int(round(cx + search_r)))
-            fy1 = min(h_img, int(round(cy + search_r)))
-            fcrop = calibrated_img[fy0:fy1, fx0:fx1]
-            if fcrop.size > 0:
-                fluma = fcrop[:, :, 0] * 0.299 + fcrop[:, :, 1] * 0.587 + fcrop[:, :, 2] * 0.114
-                fhsv = cv2.cvtColor(fcrop, cv2.COLOR_RGB2HSV).astype(np.float32)
-                fsat = fhsv[:, :, 1] / 255.0
-                fbeige = (fluma > 165) & (fsat < 0.30)
-                fn_lbls, _, fstats, fcentroids = cv2.connectedComponentsWithStats(fbeige.astype(np.uint8))
-                fmin_d = float('inf')
-                fb_cx, fb_cy = cx, cy
-                for fi in range(1, fn_lbls):
-                    if fstats[fi, cv2.CC_STAT_AREA] >= 80:
-                        fcx_c = fx0 + fcentroids[fi][0]
-                        fcy_c = fy0 + fcentroids[fi][1]
-                        fd = (fcx_c - cx)**2 + (fcy_c - cy)**2
-                        if fd < fmin_d:
-                            fmin_d = fd
-                            fb_cx, fb_cy = fcx_c, fcy_c
-                cx, cy = fb_cx, fb_cy
+            cx = target_cx
+            cy = target_cy
             
         span_w = hex_w * 0.32
-        span_h = hex_w * 0.32
+        span_h = hex_h * 0.32
         
         # Crop 56x56 patch around token center
         x0_i = max(0, int(round(cx - span_w / 2.0)))
@@ -457,76 +499,41 @@ def detect_tokens(center_result, tile_result):
             raw_cropped = center_result["normalizedImage"][y0_i:y1_i, x0_i:x1_i]
             raw_patch = cv2.resize(raw_cropped, (56, 56), interpolation=cv2.INTER_LINEAR)
             
-        edge_vector = extract_edge_vector(patch, 56, 56)
-        ink_vector = build_ink_mask(patch)
+        digit_roi = extract_digit_roi(patch)
+        numeric_ocr_scores = predict_numeric_ocr_scores(digit_roi)
+        has_double_width = is_double_digit(digit_roi)
         
-        # Red token heuristic (evaluate on raw un-calibrated patch)
-        hsv_patch = cv2.cvtColor(raw_patch, cv2.COLOR_RGB2HSV)
-        h_chan = hsv_patch[:, :, 0]
-        s_chan = hsv_patch[:, :, 1]
-        v_chan = hsv_patch[:, :, 2]
-        
-        h_p, w_p, _ = raw_patch.shape
-        cy_d, cx_d = h_p // 2, w_p // 2
-        y_idx, x_idx = np.ogrid[:h_p, :w_p]
-        disk_mask = ((x_idx - cx_d)**2 + (y_idx - cy_d)**2) <= (13.0**2)
-        
-        r_mask = ((h_chan < 12) | (h_chan > 168)) & (s_chan > 35) & (v_chan > 70) & disk_mask
+        # Red token heuristic (evaluate on bounded digit_roi)
+        hsv_roi = cv2.cvtColor(digit_roi, cv2.COLOR_RGB2HSV)
+        h_chan, s_chan, v_chan = hsv_roi[:, :, 0], hsv_roi[:, :, 1], hsv_roi[:, :, 2]
+        r_mask = ((h_chan < 15) | (h_chan > 165)) & (s_chan > 40) & (v_chan > 70)
         red_count = np.sum(r_mask)
-        is_red = red_count >= 20
+        is_red = red_count >= 15
         
         scores = {}
         best_token = None
         best_score = float('-inf')
         second_best_score = float('-inf')
         
-        digit_roi = extract_digit_roi(patch)
-        ocr_digit = run_tesseract_ocr(digit_roi)
-        has_double_width = is_double_digit(digit_roi)
-        
-        # Use un-calibrated raw_patch for pip detection!
-        pip_count = detect_probability_pips(raw_patch, is_red)
-        
-        # Log pip detection output for debugging
-        print(f"[PIP DETECT] Tile {tile['tileId']:2d}: Detected {pip_count} pips (red={is_red})")
-        
         for val in TOKEN_VALUES:
             t = templates[val]
-            edge_score = best_similarity(edge_vector, t["edgeVectors"])
-            ink_score = best_similarity(ink_vector, t["inkVectors"])
-            
-            # Digit ROI SSIM score
+            ocr_s = numeric_ocr_scores.get(val, 0.0)
             ssim_score = max(0.0, max(compute_ssim(digit_roi, tmpl_roi) for tmpl_roi in t["digitROIs"]))
             
-            # Weighted blend: 40% SSIM Digit + 35% Ink + 15% Edge
-            score = ssim_score * 0.40 + ink_score * 0.35 + edge_score * 0.15
+            # Numeric OCR + SSIM Template Ensemble
+            score = ocr_s * 0.50 + ssim_score * 0.50
             
-            # Tesseract OCR match boost
-            if ocr_digit is not None and val == ocr_digit:
-                score += 0.35
-            # Soft digit width topology guidance (+0.25 / -0.25)
-            if val in (10, 11, 12):
-                score += 0.25 if has_double_width else -0.25
-            else:
-                score += -0.25 if has_double_width else 0.10
-                
-            # Boost 6/8 if red, heavily penalize if not
+            # Strict domain rules: Red ink (6/8) & Double digit width (10/11/12)
             if val == 6 or val == 8:
-                score += 0.4 if is_red else -0.8
+                score += 0.5 if is_red else -2.0
             else:
-                score += -0.8 if is_red else 0.0
+                score += -2.0 if is_red else 0.0
                 
-            # Probability pips scoring guidance (+0.45 boost / -0.60 penalty)
-            if pip_count is not None:
-                exp_pips = EXPECTED_TOKEN_PIPS.get(val, 0)
-                diff = abs(pip_count - exp_pips)
-                if diff == 0:
-                    score += 0.45
-                elif diff == 1:
-                    score -= 0.20
-                else:
-                    score -= 0.60
-                    
+            if val in (10, 11, 12):
+                score += 0.5 if has_double_width else -2.0
+            else:
+                score += -2.0 if has_double_width else 0.10
+                
             scores[val] = score
             
             if score > best_score:
@@ -545,8 +552,7 @@ def detect_tokens(center_result, tile_result):
             "y": cy,
             "token": best_token,
             "tokenConfidence": confidence,
-            "isDoubleWidth": has_double_width,
-            "pipCount": pip_count
+            "isDoubleWidth": has_double_width
         })
         
     globally_assigned = global_assign_tokens(scored_land_tiles, mode_key)
@@ -567,8 +573,7 @@ def detect_tokens(center_result, tile_result):
                 **tile,
                 "token": assigned["token"] if assigned else None,
                 "tokenConfidence": assigned["tokenConfidence"] if assigned else 0.0,
-                "isDoubleWidth": assigned["isDoubleWidth"] if assigned else False,
-                "pipCount": assigned["pipCount"] if assigned else None
+                "isDoubleWidth": assigned["isDoubleWidth"] if assigned else False
             })
             
     return {

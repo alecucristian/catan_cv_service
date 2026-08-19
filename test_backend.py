@@ -239,12 +239,31 @@ def process_image(image_path, output_dir="./test_outputs"):
     matching_tiles = sum(1 for e, d in zip(exp_tiles, det_tiles) if e == d)
     total_exp_tiles = len(exp_tiles)
 
+    # Parse harbors for matching count
+    def parse_h_map(p_list):
+        h_map = {}
+        for p in p_list:
+            m = re.match(r'(\d+)([TWBSGO])', p)
+            if m:
+                h_map[int(m.group(1))] = m.group(2)
+        # Check if single letter at end is slot 0
+        if 0 not in h_map:
+            m0 = re.search(r'([TWBSGO])$', "".join(p_list))
+            if m0: h_map[0] = m0.group(1)
+        return h_map
+
+    exp_h_map = parse_h_map(exp_ports)
+    det_h_map = parse_h_map(det_ports)
+    matching_harbors = sum(1 for slot, htype in exp_h_map.items() if det_h_map.get(slot) == htype)
+    total_exp_harbors = max(9, len(exp_h_map))
+
     is_match = (det_clean == exp_clean)
 
     print("Pipeline Execution Complete:")
     print(f"  Detected Board Code: {det_clean}")
     print(f"  Expected Board Code: {exp_clean}")
     print(f"  Matching Tiles:      {matching_tiles}/{total_exp_tiles}")
+    print(f"  Matching Harbors:    {matching_harbors}/{total_exp_harbors}")
     print(f"  Overall Match:       {'PASSED' if is_match else 'FAILED'}")
 
     os.makedirs(output_dir, exist_ok=True)
