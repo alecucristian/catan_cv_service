@@ -1094,8 +1094,9 @@ def normalize_centers_to_ideal_grid(layout, frame_slots, candidate_centers, mark
     rng = random.Random(42)
 
     inlier_threshold = NORMALIZED_BOARD_SIZE * 0.05
-    best_inliers = []
+    best_inliers: list[int] = []
     best_t = None
+
 
     for _ in range(120):
         idx1, idx2 = rng.sample(range(len(tile_ids)), 2)
@@ -1197,10 +1198,11 @@ def detect_centers(img_rgb, mode_key):
     # Global regular hex grid normalization to ensure all centers are perfectly equidistant
     grid_normalized = normalize_centers_to_ideal_grid(
         layout,
-        refined["frameSlots"],
+        frame_slots,
         color_patch_refined["centers"],
         marker_info["markers"]
     )
+
     final_centers = grid_normalized["centers"]
     final_frame_slots = grid_normalized["frameSlots"]
 

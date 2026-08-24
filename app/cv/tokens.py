@@ -168,8 +168,9 @@ def ensure_numeric_template_masks():
     return _numeric_template_masks
 
 def shift_image(img, dx, dy):
-    M = np.float32([[1, 0, dx], [0, 1, dy]])
+    M = np.array([[1, 0, dx], [0, 1, dy]], dtype=np.float32)
     return cv2.warpAffine(img, M, (img.shape[1], img.shape[0]))
+
 
 def predict_numeric_ocr_scores(digit_roi):
     """
@@ -430,8 +431,11 @@ def detect_tokens(center_result, tile_result):
     scored_land_tiles = []
     for tile in land_tiles:
         tile_center = next((c for c in center_result["centers"] if c["tileId"] == tile["tileId"]), None)
+        if tile_center is None:
+            continue
         cx = tile_center["x"]
         cy = tile_center["y"]
+
         
         # Token markers on Colonist.io web canvas rendered at lower portion of hex tile
         target_cx = cx

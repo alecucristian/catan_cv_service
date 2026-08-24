@@ -1,31 +1,91 @@
-import os
-import sys
-import glob
 import re
 import cv2
 import numpy as np
 
-# Add app to path so we can import app.cv
-sys.path.insert(0, "/app")
+# Mapping from single-letter code to full resource name
+RESOURCE_CODE_TO_NAME = {
+    "S": "sheep",
+    "O": "ore",
+    "G": "wheat",
+    "W": "wood",
+    "B": "brick",
+    "D": "desert",
+}
 
-from app.cv.pipeline import run_pipeline
+NAME_TO_RESOURCE_CODE = {
+    "sheep": "S",
+    "ore": "O",
+    "wheat": "G",
+    "wood": "W",
+    "brick": "B",
+    "desert": "D",
+}
 
-def parse_board_code(code_str):
+HARBOR_CODE_TO_LABEL = {
+    "T": "3:1",
+    "W": "wood 2:1",
+    "B": "brick 2:1",
+    "S": "sheep 2:1",
+    "G": "wheat 2:1",
+    "O": "ore 2:1",
+}
+
+LABEL_TO_HARBOR_CODE = {
+    "3:1": "T",
+    "wood 2:1": "W",
+    "brick 2:1": "B",
+    "sheep 2:1": "S",
+    "wheat 2:1": "G",
+    "ore 2:1": "O",
+}
+
+
+def parse_board_code(code_str: str):
     """
-    Parses a board code string into tile codes and port codes.
-    E.g. S9O10S8...P0T2O4G -> tiles: ['S9', 'O10', 'S8', ...], harbors: ['0T', '2O', '4G', ...]
+    Parses a board code string into tile codes and harbor mapping.
+    Format: <Tiles> P0 <Letter><Slot>...<Slot0Letter>
+    E.g. S9O10S8...P0W2T4G6T8T10O12B14T16S
     """
     clean = code_str.replace(" ", "")
     if "P" in clean:
         tile_part, harbor_part = clean.split("P", 1)
     else:
         tile_part, harbor_part = clean, ""
-        
+
     tiles = [f"{r}{num}" for r, num in re.findall(r'([SOGWBD])(\d*)', tile_part)]
-    harbors = [f"{slot}{htype}" for slot, htype in re.findall(r'(\d+)([TWBSGO])', harbor_part)]
+    
+    # Strip leading '0' prefix if present from P0
+    if harbor_part.startswith("0"):
+        harbor_body = harbor_part[1:]
+    else:
+        harbor_body = harbor_part
+
+    # Find pairs of (Letter, SlotNumber)
+    pairs = re.findall(r'([TWBSGO])(\d+)', harbor_body)
+    harbors = [f"{int(slot)}{htype}" for htype, slot in pairs]
+
+    # Check for trailing slot 0 letter
+    m0 = re.search(r'([TWBSGO])$', harbor_body)
+    if m0:
+        harbors.append(f"0{m0.group(1)}")
+
     return tiles, harbors
 
-def fit_text_scale(text, font, initial_scale, max_width, min_scale=0.2, thickness=1):
+
+def parse_harbor_map(port_list: list[str]) -> dict[int, str]:
+    """
+    Parses harbor code list into a map of slot_index -> harbor_type_code (e.g. 2 -> 'W', 0 -> 'S').
+    """
+    h_map = {}
+    for p in port_list:
+        m = re.match(r'(\d+)([TWBSGO])', p)
+        if m:
+            h_map[int(m.group(1))] = m.group(2)
+    return h_map
+
+
+
+def fit_text_scale(text: str, font: int, initial_scale: float, max_width: int, min_scale: float = 0.2, thickness: int = 1):
     """
     Calculates font_scale and text size ensuring the text width does not exceed max_width.
     """
@@ -36,14 +96,15 @@ def fit_text_scale(text, font, initial_scale, max_width, min_scale=0.2, thicknes
         (tw, th), _ = cv2.getTextSize(text, font, scale, thickness)
     return scale, tw, th
 
-def draw_detection_overlay(img_bgr, result, expected_code=None, filename=""):
+
+def draw_detection_overlay(img_bgr: np.ndarray, result: dict, expected_code: str | None = None, filename: str = "") -> np.ndarray:
     """
     Draws detected hex centers, terrain types, token numbers, harbor positions,
     and a summary banner onto the image with auto-fitted text.
     """
     overlay = img_bgr.copy()
     h, w, _ = overlay.shape
-    
+
     orig_bounds = result["bounds"]["original"]
     scale_x = orig_bounds["w"] / 960.0
     scale_y = orig_bounds["h"] / 960.0
@@ -114,7 +175,7 @@ def draw_detection_overlay(img_bgr, result, expected_code=None, filename=""):
             ty = cy - 2
             cv2.putText(overlay, label, (tx, ty), font, font_scale, text_color, thickness, cv2.LINE_AA)
 
-            # Build sub-label for debug inspection: e.g. "2W •3" or "1W •2"
+            # Sub-label for debug inspection
             w_str = "2W" if tile.get("isDoubleWidth") else "1W"
             p_val = tile.get("pipCount")
             p_str = f"p{p_val}" if p_val is not None else "p-"
@@ -128,9 +189,9 @@ def draw_detection_overlay(img_bgr, result, expected_code=None, filename=""):
     # 3. Draw Ports / Harbors
     for port in result.get("ports", []):
         slot_index = port["slotIndex"]
-        label = port["label"]  # e.g. "wood 2:1" or "3:1"
+        label = port["label"]
         slot = slots_by_index.get(slot_index)
-        
+
         norm_x = port.get("x", slot["x"] if slot else 0)
         norm_y = port.get("y", slot["y"] if slot else 0)
         px, py = to_orig(norm_x, norm_y)
@@ -138,11 +199,9 @@ def draw_detection_overlay(img_bgr, result, expected_code=None, filename=""):
         p_radius = int(round(22 * scale_x))
         p_radius = max(18, min(40, p_radius))
 
-        # Harbor badge (Cyan)
         cv2.circle(overlay, (px, py), p_radius, (255, 220, 0), -1)
         cv2.circle(overlay, (px, py), p_radius, (0, 0, 0), 2)
 
-        # Format port label into 2 lines: Line 1 = P{slot_index}, Line 2 = Harbor Type
         res_map = {"wood": "W", "brick": "B", "sheep": "S", "wheat": "G", "ore": "O"}
         if "3:1" in label:
             line1 = f"P{slot_index}"
@@ -161,13 +220,13 @@ def draw_detection_overlay(img_bgr, result, expected_code=None, filename=""):
         cv2.putText(overlay, line1, (px - tw1 // 2, py - 2), font, scale1, (0, 0, 0), 1, cv2.LINE_AA)
         cv2.putText(overlay, line2, (px - tw2 // 2, py + th2 + 2), font, scale2, (0, 0, 0), 1, cv2.LINE_AA)
 
-    # 4. Draw Header Banner with Expected vs Detected status
+    # 4. Draw Header Banner
     det_code = result["boardCode"].replace(" ", "")
     det_clean = det_code
     exp_clean = expected_code.replace(" ", "") if expected_code else None
 
     is_match = (exp_clean == det_clean) if exp_clean else None
-    
+
     line_count = 4 if expected_code else 3
     banner_h = max(115, line_count * 28)
     banner = np.zeros((banner_h, w, 3), dtype=np.uint8)
@@ -178,7 +237,6 @@ def draw_detection_overlay(img_bgr, result, expected_code=None, filename=""):
 
     max_banner_w = w - 30
 
-    # Line 1: Title & Status
     title_str = f"File: {filename}" if filename else "Catan CV Detection Result"
     t_scale, tw, th = fit_text_scale(title_str, font, 0.55, max_banner_w - 180, 0.3, 2)
     cv2.putText(overlay, title_str, (15, 26), font, t_scale, (255, 255, 255), 2, cv2.LINE_AA)
@@ -189,18 +247,15 @@ def draw_detection_overlay(img_bgr, result, expected_code=None, filename=""):
         s_scale, sw, sh = fit_text_scale(status_str, font, 0.55, 160, 0.3, 2)
         cv2.putText(overlay, status_str, (w - sw - 15, 26), font, s_scale, status_color, 2, cv2.LINE_AA)
 
-    # Line 2: Detected Line
     det_str = f"Detected: {det_code}"
     d_scale, dw, dh = fit_text_scale(det_str, font, 0.45, max_banner_w, 0.2, 1)
     cv2.putText(overlay, det_str, (15, 54), font, d_scale, (0, 255, 255), 1, cv2.LINE_AA)
 
-    # Line 3: Expected Line
     if expected_code:
         exp_str = f"Expected: {expected_code}"
         e_scale, ew, eh = fit_text_scale(exp_str, font, 0.45, max_banner_w, 0.2, 1)
         cv2.putText(overlay, exp_str, (15, 80), font, e_scale, (200, 200, 200), 1, cv2.LINE_AA)
-        
-        # Line 4: Stats Line
+
         stats_str = f"Mode: {result['modeKey']} | Hexes: {len(result['centers'])} | Ports: {len(result['ports'])} | Quality: {result['quality']['overall']:.3f}"
         st_scale, stw, sth = fit_text_scale(stats_str, font, 0.42, max_banner_w, 0.2, 1)
         cv2.putText(overlay, stats_str, (15, 104), font, st_scale, (170, 170, 170), 1, cv2.LINE_AA)
@@ -210,113 +265,3 @@ def draw_detection_overlay(img_bgr, result, expected_code=None, filename=""):
         cv2.putText(overlay, stats_str, (15, 80), font, st_scale, (170, 170, 170), 1, cv2.LINE_AA)
 
     return overlay
-
-def process_image(image_path, output_dir="./test_outputs"):
-    filename = os.path.basename(image_path)
-    expected_code = os.path.splitext(filename)[0]
-
-    print(f"\n==========================================")
-    print(f"Testing image: {filename}")
-    print(f"==========================================")
-    
-    img_bgr = cv2.imread(image_path)
-    if img_bgr is None:
-        print(f"Error: Could not load image from {image_path}!")
-        return False
-        
-    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    
-    print("Running board detection pipeline...")
-    result = run_pipeline(img_rgb, "four")
-    
-    detected_code = result['boardCode']
-    det_clean = detected_code.replace(" ", "")
-    exp_clean = expected_code.replace(" ", "")
-
-    exp_tiles, exp_ports = parse_board_code(expected_code)
-    det_tiles, det_ports = parse_board_code(detected_code)
-
-    matching_tiles = sum(1 for e, d in zip(exp_tiles, det_tiles) if e == d)
-    total_exp_tiles = len(exp_tiles)
-
-    # Parse harbors for matching count
-    def parse_h_map(p_list):
-        h_map = {}
-        for p in p_list:
-            m = re.match(r'(\d+)([TWBSGO])', p)
-            if m:
-                h_map[int(m.group(1))] = m.group(2)
-        # Check if single letter at end is slot 0
-        if 0 not in h_map:
-            m0 = re.search(r'([TWBSGO])$', "".join(p_list))
-            if m0: h_map[0] = m0.group(1)
-        return h_map
-
-    exp_h_map = parse_h_map(exp_ports)
-    det_h_map = parse_h_map(det_ports)
-    matching_harbors = sum(1 for slot, htype in exp_h_map.items() if det_h_map.get(slot) == htype)
-    total_exp_harbors = max(9, len(exp_h_map))
-
-    is_match = (det_clean == exp_clean)
-
-    print("Pipeline Execution Complete:")
-    print(f"  Detected Board Code: {det_clean}")
-    print(f"  Expected Board Code: {exp_clean}")
-    print(f"  Matching Tiles:      {matching_tiles}/{total_exp_tiles}")
-    print(f"  Matching Harbors:    {matching_harbors}/{total_exp_harbors}")
-    print(f"  Overall Match:       {'PASSED' if is_match else 'FAILED'}")
-
-    os.makedirs(output_dir, exist_ok=True)
-    out_filename = f"output_{filename}"
-    output_path = os.path.join(output_dir, out_filename)
-
-    annotated_img = draw_detection_overlay(img_bgr, result, expected_code=expected_code, filename=filename)
-    cv2.imwrite(output_path, annotated_img)
-    
-    # Also save to ./test_output.jpeg for backward compatibility
-    cv2.imwrite("./test_output.jpeg", annotated_img)
-    
-    print(f"  Overlay result saved to: {output_path}")
-
-    return is_match
-
-def main():
-    test_dir = "./test_images"
-    image_paths = []
-
-    if os.path.exists(test_dir):
-        for ext in ("*.jpeg", "*.jpg", "*.png", "*.webp"):
-            image_paths.extend(glob.glob(os.path.join(test_dir, ext)))
-
-    if not image_paths:
-        # Fallback to catan_image.jpeg if test_images directory has no images
-        fallback = "./catan_image.jpeg"
-        if os.path.exists(fallback):
-            image_paths = [fallback]
-        else:
-            print("No test images found in ./test_images or workspace root!")
-            sys.exit(1)
-
-    print(f"Found {len(image_paths)} test image(s) in test dataset.")
-
-    passed_count = 0
-    total_count = len(image_paths)
-
-    for img_path in sorted(image_paths):
-        try:
-            passed = process_image(img_path)
-            if passed:
-                passed_count += 1
-        except Exception as e:
-            print(f"Error processing {img_path}: {str(e)}")
-            import traceback
-            traceback.print_exc()
-
-    print(f"\n==========================================")
-    print(f"TEST SUMMARY: {passed_count}/{total_count} PASSED")
-    print(f"==========================================")
-
-if __name__ == "__main__":
-    main()
-
-

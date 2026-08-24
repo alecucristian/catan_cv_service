@@ -68,9 +68,10 @@ def global_assign_harbors(scored_slots, mode_key):
 def detect_harbors(center_result):
     mode_key = "six" if center_result["modeKey"] == "six" else "four"
     
-    from .tokens import calibrate_canvas_colors
-    calibrated_img = calibrate_canvas_colors(center_result["normalizedImage"])
+    # Digital screenshots use pristine flat RGB signatures (no grey-world distortion)
+    calibrated_img = center_result["normalizedImage"]
     h_img, w_img, _ = calibrated_img.shape
+
     
     hex_w = center_result["geometry"]["hexW"]
     frame_slots = center_result["frameSlots"]
@@ -85,11 +86,14 @@ def detect_harbors(center_result):
         "wheat 2:1": "templates/harbor_grain.png",
         "ore 2:1": "templates/harbor_ore.png"
     }
-    tmpl_rgb = {}
+    tmpls_bgr = {}
     for htype, path_rel in tmpl_files.items():
         path = os.path.join(base_dir, path_rel)
-        rgb = cv2.cvtColor(cv2.imread(path), cv2.COLOR_BGR2RGB)
-        tmpl_rgb[htype] = cv2.resize(rgb, (40, 40))
+        tmpl_img = cv2.imread(path)
+        if tmpl_img is not None:
+            tmpls_bgr[htype] = tmpl_img
+        else:
+            tmpls_bgr[htype] = np.zeros((70, 70, 3), dtype=np.uint8)
         
     scored_slots = []
     gray_img = cv2.cvtColor(calibrated_img, cv2.COLOR_RGB2GRAY)
@@ -97,56 +101,31 @@ def detect_harbors(center_result):
     for slot in frame_slots:
         sx, sy = int(round(slot["x"])), int(round(slot["y"]))
         # Search radius around island proximity point to snap onto white sail
-        R = int(round(hex_w * 0.32))
-        y0_s, y1_s = max(0, sy - R), min(h_img, sy + R)
-        x0_s, x1_s = max(0, sx - R), min(w_img, sx + R)
-        search_gray = gray_img[y0_s:y1_s, x0_s:x1_s]
-        
+        R = int(round(hex_w * 0.28))
+        search = gray_img[max(0, sy - R):min(h_img, sy + R), max(0, sx - R):min(w_img, sx + R)]
         snap_x, snap_y = sx, sy
-        if search_gray.size > 0:
-            mask_sail = search_gray > 200
-            if np.any(mask_sail):
-                ys_s, xs_s = np.where(mask_sail)
-                snap_y = int(round(y0_s + np.mean(ys_s)))
-                snap_x = int(round(x0_s + np.mean(xs_s)))
-                
-        span = int(round(hex_w * 0.45))
-        y0 = max(0, snap_y - span // 2)
-        y1 = min(h_img, snap_y + span // 2)
-        x0 = max(0, snap_x - span // 2)
-        x1 = min(w_img, snap_x + span // 2)
-        cropped = calibrated_img[y0:y1, x0:x1]
-        
-        if cropped.size == 0:
-            flag_crop = np.zeros((40, 40, 3), dtype=np.uint8)
-        else:
-            gray_c = cv2.cvtColor(cropped, cv2.COLOR_RGB2GRAY)
-            mask = gray_c > 180
-            if np.any(mask):
-                ys, xs = np.where(mask)
-                cy, cx = int(round(np.mean(ys))), int(round(np.mean(xs)))
-                r_crop = 18
-                cy0, cy1 = max(0, cy - r_crop), min(cropped.shape[0], cy + r_crop)
-                cx0, cx1 = max(0, cx - r_crop), min(cropped.shape[1], cx + r_crop)
-                patch = cropped[cy0:cy1, cx0:cx1]
-                flag_crop = cv2.resize(patch, (40, 40)) if patch.size > 0 else cv2.resize(cropped, (40, 40))
-            else:
-                flag_crop = cv2.resize(cropped, (40, 40))
-                
-        feat = flag_crop.astype(np.float32) / 255.0
-        scores = {}
-        for htype in HARBOR_TYPES:
-            t_img = tmpl_rgb[htype]
-            t_feat = t_img.astype(np.float32) / 255.0
-            best_diff = 1.0
-            for dx in (-2, 0, 2):
-                for dy in (-2, 0, 2):
-                    M = np.float32([[1, 0, dx], [0, 1, dy]])
-                    s_feat = cv2.warpAffine(feat, M, (40, 40))
-                    diff = float(np.mean(np.abs(s_feat - t_feat)))
-                    if diff < best_diff: best_diff = diff
-            scores[htype] = 1.0 - best_diff
+        if search.size > 0 and np.any(search > 200):
+            ys, xs = np.where(search > 200)
+            snap_y = max(0, sy - R) + int(round(np.mean(ys)))
+            snap_x = max(0, sx - R) + int(round(np.mean(xs)))
             
+        crop_rgb = calibrated_img[max(0, snap_y - 36):min(h_img, snap_y + 36), max(0, snap_x - 36):min(w_img, snap_x + 36)]
+        crop_bgr = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2BGR) if crop_rgb.size > 0 else np.zeros((40, 40, 3), dtype=np.uint8)
+
+        scores = {}
+        for htype, t_img in tmpls_bgr.items():
+            best_val = -1.0
+            for scale in (0.36, 0.40, 0.44, 0.48, 0.52):
+                tw = int(round(t_img.shape[1] * scale))
+                th = int(round(t_img.shape[0] * scale))
+                if crop_bgr.shape[0] >= th and crop_bgr.shape[1] >= tw:
+                    t_scaled = cv2.resize(t_img, (tw, th))
+                    m_res = cv2.matchTemplate(crop_bgr, t_scaled, cv2.TM_CCOEFF_NORMED)
+                    val = float(np.max(m_res))
+                    if val > best_val:
+                        best_val = val
+            scores[htype] = best_val
+
         scored_slots.append({
             "slotIndex": slot["slotIndex"],
             "x": slot["x"],
@@ -154,6 +133,7 @@ def detect_harbors(center_result):
             "angle": slot["angle"],
             "scores": scores
         })
+
         
     globally_assigned = global_assign_harbors(scored_slots, mode_key)
     
