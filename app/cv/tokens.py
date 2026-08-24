@@ -301,33 +301,6 @@ def make_variants(img_rgb, out_width, out_height, scales, offsets):
             variants.append(variant)
     return variants
 
-def cosine_similarity(a, b):
-    return float(np.sum(a * b))
-
-def best_similarity(vector, bank):
-    if isinstance(bank, np.ndarray):
-        return float(np.max(np.dot(bank, vector)))
-    elif isinstance(bank, list) and len(bank) > 0:
-        bank_mat = np.array(bank, dtype=np.float32)
-        return float(np.max(np.dot(bank_mat, vector)))
-    return float('-inf')
-
-def calibrate_canvas_colors(img_rgb):
-    mean_r = np.mean(img_rgb[:, :, 0])
-    mean_g = np.mean(img_rgb[:, :, 1])
-    mean_b = np.mean(img_rgb[:, :, 2])
-    gray = (mean_r + mean_g + mean_b) / 3.0
-    scale_r = gray / max(1.0, mean_r)
-    scale_g = gray / max(1.0, mean_g)
-    scale_b = gray / max(1.0, mean_b)
-    
-    calibrated = np.zeros_like(img_rgb, dtype=np.uint8)
-    for c in range(3):
-        scale = scale_r if c == 0 else (scale_g if c == 1 else scale_b)
-        scaled_ch = (img_rgb[:, :, c].astype(np.float32) * scale) / 255.0
-        calibrated[:, :, c] = np.clip(np.power(scaled_ch, 0.95) * 255.0, 0, 255).astype(np.uint8)
-        
-    return calibrated
 
 # Template store singleton representation in Python
 _token_template_store = None
@@ -338,38 +311,16 @@ def ensure_token_template_store():
         return _token_template_store
         
     store = {}
-    scales = [0.9, 1.0, 1.1]
-    offsets = [
-        {"dx": 0, "dy": 0},
-        {"dx": -1, "dy": 0},
-        {"dx": 1, "dy": 0},
-        {"dx": 0, "dy": -1},
-        {"dx": 0, "dy": 1}
-    ]
-    
-    # Path relative to working directory or absolute
     base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     templates_path = os.path.join(base_dir, "templates")
     
     for val in TOKEN_VALUES:
         filename = f"num_{val}.png"
         path = os.path.join(templates_path, filename)
-        
-        # Read image
         img_bgr = cv2.imread(path)
         if img_bgr is None:
             raise FileNotFoundError(f"Could not load token template at path: {path}")
-        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        
-        # Base resize to 56x56
-        base = cv2.resize(img_rgb, (56, 56), interpolation=cv2.INTER_LINEAR)
-        variants = make_variants(base, 56, 56, scales, offsets)
-        
-        store[val] = {
-            "edgeVectors": np.array([extract_edge_vector(v, 56, 56) for v in variants], dtype=np.float32),
-            "inkVectors": np.array([build_ink_mask(v) for v in variants], dtype=np.float32),
-            "digitROIs": [extract_digit_roi(v) for v in variants]
-        }
+        store[val] = img_bgr
         
     _token_template_store = store
     return _token_template_store
@@ -419,117 +370,45 @@ def detect_tokens(center_result, tile_result):
     templates = ensure_token_template_store()
     mode_key = "six" if center_result["modeKey"] == "six" else "four"
     
-    calibrated_img = calibrate_canvas_colors(center_result["normalizedImage"])
-    h_img, w_img, _ = calibrated_img.shape
-    
-    hex_w = center_result["geometry"]["hexW"]
+    norm_img = center_result["normalizedImage"]
+    norm_bgr = cv2.cvtColor(norm_img, cv2.COLOR_RGB2BGR)
+    h_img, w_img, _ = norm_img.shape
     hex_h = center_result["geometry"]["hexH"]
-    search_dist = hex_w * 0.25
     
     land_tiles = [tile for tile in tile_result["tiles"] if tile["resource"] != "desert"]
-    
     scored_land_tiles = []
+    
     for tile in land_tiles:
         tile_center = next((c for c in center_result["centers"] if c["tileId"] == tile["tileId"]), None)
         if tile_center is None:
             continue
-        cx = tile_center["x"]
-        cy = tile_center["y"]
-
+        cx = int(round(tile_center["x"]))
+        cy = int(round(tile_center["y"] + hex_h * 0.20))
         
-        # Token markers on Colonist.io web canvas rendered at lower portion of hex tile
-        target_cx = cx
-        target_cy = cy + hex_h * 0.20
-        
-        # Find closest valid token marker (rejecting Ore rocks at upper hex)
-        closest_marker = None
-        min_dist = float('inf')
-        markers = center_result["markerDebug"]["markers"]
-        for m in markers:
-            d = math.hypot(m["x"] - target_cx, m["y"] - target_cy)
-            if d < search_dist and d < min_dist:
-                min_dist = d
-                closest_marker = m
-                
-        if closest_marker:
-            cx = closest_marker["x"]
-            cy = closest_marker["y"]
+        crop = norm_bgr[max(0, cy - 32):min(h_img, cy + 32), max(0, cx - 32):min(w_img, cx + 32)]
+        if crop.size == 0:
+            scores = {val: 0.0 for val in TOKEN_VALUES}
         else:
-            cx = target_cx
-            cy = target_cy
-            
-        span_w = hex_w * 0.32
-        span_h = hex_h * 0.32
-        
-        # Crop 56x56 patch around token center
-        x0_i = max(0, int(round(cx - span_w / 2.0)))
-        y0_i = max(0, int(round(cy - span_h / 2.0)))
-        x1_i = min(w_img, int(round(cx + span_w / 2.0)))
-        y1_i = min(h_img, int(round(cy + span_h / 2.0)))
-        
-        cropped = calibrated_img[y0_i:y1_i, x0_i:x1_i]
-        if cropped.size == 0:
-            patch = np.zeros((56, 56, 3), dtype=np.uint8)
-            raw_patch = np.zeros((56, 56, 3), dtype=np.uint8)
-        else:
-            patch = cv2.resize(cropped, (56, 56), interpolation=cv2.INTER_LINEAR)
-            raw_cropped = center_result["normalizedImage"][y0_i:y1_i, x0_i:x1_i]
-            raw_patch = cv2.resize(raw_cropped, (56, 56), interpolation=cv2.INTER_LINEAR)
-            
-        digit_roi = extract_digit_roi(patch)
-        numeric_ocr_scores = predict_numeric_ocr_scores(digit_roi)
-        has_double_width = is_double_digit(digit_roi)
-        
-        # Red token heuristic (evaluate on bounded digit_roi)
-        hsv_roi = cv2.cvtColor(digit_roi, cv2.COLOR_RGB2HSV)
-        h_chan, s_chan, v_chan = hsv_roi[:, :, 0], hsv_roi[:, :, 1], hsv_roi[:, :, 2]
-        r_mask = ((h_chan < 15) | (h_chan > 165)) & (s_chan > 40) & (v_chan > 70)
-        red_count = np.sum(r_mask)
-        is_red = red_count >= 15
-        
-        scores = {}
-        best_token = None
-        best_score = float('-inf')
-        second_best_score = float('-inf')
-        
-        for val in TOKEN_VALUES:
-            t = templates[val]
-            ocr_s = numeric_ocr_scores.get(val, 0.0)
-            ssim_score = max(0.0, max(compute_ssim(digit_roi, tmpl_roi) for tmpl_roi in t["digitROIs"]))
-            
-            # Numeric OCR + SSIM Template Ensemble
-            score = ocr_s * 0.50 + ssim_score * 0.50
-            
-            # Strict domain rules: Red ink (6/8) & Double digit width (10/11/12)
-            if val == 6 or val == 8:
-                score += 0.5 if is_red else -2.0
-            else:
-                score += -2.0 if is_red else 0.0
+            scores = {}
+            for val, t_img in templates.items():
+                best_val = -1.0
+                for scale in (0.35, 0.40, 0.45, 0.50, 0.55):
+                    tw = int(round(t_img.shape[1] * scale))
+                    th = int(round(t_img.shape[0] * scale))
+                    if crop.shape[0] >= th and crop.shape[1] >= tw:
+                        ts = cv2.resize(t_img, (tw, th))
+                        m = cv2.matchTemplate(crop, ts, cv2.TM_CCOEFF_NORMED)
+                        val_score = float(np.max(m))
+                        if val_score > best_val:
+                            best_val = val_score
+                scores[val] = best_val
                 
-            if val in (10, 11, 12):
-                score += 0.5 if has_double_width else -2.0
-            else:
-                score += -2.0 if has_double_width else 0.10
-                
-            scores[val] = score
-            
-            if score > best_score:
-                second_best_score = best_score
-                best_score = score
-                best_token = val
-            elif score > second_best_score:
-                second_best_score = score
-                
-        confidence = clamp(0.5 + (best_score - second_best_score) * 0.25, 0.0, 1.0)
-        
         scored_land_tiles.append({
             "tileId": tile["tileId"],
             "scores": scores,
             "x": cx,
             "y": cy,
-            "token": best_token,
-            "tokenConfidence": confidence,
-            "isDoubleWidth": has_double_width
+            "isDoubleWidth": False
         })
         
     globally_assigned = global_assign_tokens(scored_land_tiles, mode_key)
@@ -557,3 +436,4 @@ def detect_tokens(center_result, tile_result):
         "modeKey": mode_key,
         "tiles": all_tiles
     }
+

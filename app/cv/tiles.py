@@ -107,6 +107,7 @@ def extract_tile_body_features(img_rgb, center, geometry):
     sum_h = 0.0
     sum_s = 0.0
     sum_v = 0.0
+    sum_rg = 0.0
     count = 0
     texture_energy = 0.0
     
@@ -135,6 +136,7 @@ def extract_tile_body_features(img_rgb, center, geometry):
             sum_h += h
             sum_s += s
             sum_v += v
+            sum_rg += (float(color[0]) - float(color[1]))
             count += 1
             
             gx = luma[y, x + 1] - luma[y, x - 1]
@@ -142,12 +144,13 @@ def extract_tile_body_features(img_rgb, center, geometry):
             texture_energy += math.sqrt(gx*gx + gy*gy)
             
     if count == 0:
-        return {"h": 0.0, "s": 0.0, "v": 0.0, "texture": 0.0}
+        return {"h": 0.0, "s": 0.0, "v": 0.0, "rg": 0.0, "texture": 0.0}
         
     return {
         "h": sum_h / count,
         "s": sum_s / count,
         "v": sum_v / count,
+        "rg": sum_rg / count,
         "texture": texture_energy / count
     }
 
@@ -155,28 +158,39 @@ def score_body_features(features, resource):
     h = features["h"]
     s = features["s"]
     v = features["v"]
+    rg = features.get("rg", 0.0)
     
     score = 0.0
     if resource == "brick":
-        if h < 35.0 or h > 340.0:
+        if h < 38.0 or h > 340.0:
             score += 2.0
-        elif h < 45.0:
+        elif h < 48.0:
             score += 1.0
         else:
             score -= 2.0
-        if s > 0.45:
+        if rg > 45.0:
+            score += 2.5
+        elif rg > 20.0:
+            score += 1.0
+        else:
+            score -= 1.5
+        if s > 0.40:
             score += 1.0
         else:
             score -= 1.0
             
     elif resource == "wheat":
-        if 30.0 <= h <= 65.0:
+        if 32.0 <= h <= 65.0:
             score += 2.0
         elif h > 20.0 and h < 75.0:
             score += 1.0
         else:
             score -= 2.0
-        if s > 0.45:
+        if rg < 45.0:
+            score += 1.5
+        else:
+            score -= 2.0
+        if s > 0.40:
             score += 1.0
         else:
             score -= 1.0
@@ -188,7 +202,7 @@ def score_body_features(features, resource):
             score += 1.0
         else:
             score -= 2.0
-        if s > 0.4:
+        if s > 0.35:
             score += 1.0
         else:
             score -= 1.0
@@ -208,8 +222,8 @@ def score_body_features(features, resource):
             score -= 1.0
             
     elif resource == "ore":
-        if s < 0.38:
-            score += 3.0
+        if s < 0.35:
+            score += 3.5
         elif s < 0.45:
             score += 1.0
         else:
@@ -220,12 +234,13 @@ def score_body_features(features, resource):
             score += 1.0
         else:
             score -= 1.0
-        if 0.25 < s < 0.55:
+        if 0.20 < s < 0.45:
             score += 2.0
         else:
             score -= 1.0
             
     return score
+
 
 def build_repeated_label_pool(target_counts, ordered_labels):
     pool = []
@@ -318,17 +333,6 @@ def global_assign_resources(entries, mode_key):
         assigned_label = label_pool[col_ind[r_idx]]
         entry = entries[r_idx]
         
-        # Check top choice resource
-        sorted_scores = sorted(entry["scores"], key=lambda x: x["score"], reverse=True)
-        if sorted_scores:
-            top_res = sorted_scores[0]["resource"]
-            top_score = sorted_scores[0]["score"]
-            second_score = sorted_scores[1]["score"] if len(sorted_scores) > 1 else top_score - 1.0
-            
-            # If top choice is very confident, honor top choice to handle custom scenario boards
-            if top_score > 0.85 and (top_score - second_score) > 0.15:
-                assigned_label = top_res
-                
         assigned_score = next((x["score"] for x in entry["scores"] if x["resource"] == assigned_label), float('-inf'))
         next_score = next((x["score"] for x in entry["scores"] if x["resource"] != assigned_label), assigned_score - 1.0)
         
@@ -336,6 +340,7 @@ def global_assign_resources(entries, mode_key):
         entry_copy["resource"] = assigned_label
         entry_copy["confidence"] = clamp(0.44 + (assigned_score - next_score) * 0.2 + max(0.0, assigned_score) * 0.08, 0.0, 1.0)
         assigned_entries.append(entry_copy)
+
         
     return assigned_entries
 
