@@ -1,0 +1,19 @@
+name: Deploy to Raspberry Pi
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Rebuild and restart Docker containers
+        run: |
+          docker compose down
+          docker compose up -d --build
+          docker image prune -f
