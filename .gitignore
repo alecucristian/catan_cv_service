@@ -41,3 +41,8 @@ test_output.jpeg
 Thumbs.db
 .vscode/
 .idea/
+
+# Environment files
+.env
+.env.*
+!.env.example
